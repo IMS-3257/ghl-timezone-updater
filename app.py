@@ -1,16 +1,23 @@
-# app.py — resilient GHL Time Zone updater
+# app.py — Resilient GHL Time Zone updater (Google Geocoding + Time Zone API)
+# - Auto-detects the "Time Zone" custom field by label (tries multiple endpoints)
+# - Returns immediately to GHL (background task) to avoid webhook timeouts
+# - Uses POST variants to update the contact (works where PUT/PATCH 404)
+
 import os, time, requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
-GOOGLE = os.environ["GOOGLE_API_KEY"]
-GHL_KEY = os.environ["GHL_API_KEY"]
-LOCATION_ID = os.environ["GHL_LOCATION_ID"]
+# ===== Required env vars =====
+GOOGLE = os.environ["GOOGLE_API_KEY"]        # Geocoding + Time Zone APIs enabled; billing ON
+GHL_KEY = os.environ["GHL_API_KEY"]          # GoHighLevel Location API key
+LOCATION_ID = os.environ["GHL_LOCATION_ID"]  # GoHighLevel Location (sub-account) ID
 
-TZ_FIELD_ID_ENV = os.getenv("TZ_FIELD_ID")
-TZ_FIELD_LABEL = os.getenv("TZ_FIELD_LABEL", "Time Zone")
-TZ_NAME_FIELD_ID = os.getenv("TZ_NAME_FIELD_ID")
+# ===== Optional env vars =====
+TZ_FIELD_ID_ENV = os.getenv("TZ_FIELD_ID")                 # If omitted, we’ll find it by label
+TZ_FIELD_LABEL = os.getenv("TZ_FIELD_LABEL", "Time Zone")  # Label used in GHL
+TZ_NAME_FIELD_ID = os.getenv("TZ_NAME_FIELD_ID")           # Optional: store human-readable TZ name
 
+# ===== GHL base/headers =====
 GHL_BASE = "https://services.leadconnectorhq.com"
 HEADERS = {
     "Authorization": f"Bearer {GHL_KEY}",
@@ -20,8 +27,10 @@ HEADERS = {
 }
 
 app = FastAPI()
-_cache_field_ids = {"tz": TZ_FIELD_ID_ENV}
+_cache_field_ids = {"tz": TZ_FIELD_ID_ENV}  # prefer explicit env if provided
 
+
+# ---------- Models ----------
 class GHLHook(BaseModel):
     contact_id: str | None = None
     id: str | None = None
@@ -31,80 +40,103 @@ class GHLHook(BaseModel):
     postal_code: str | None = None
     zip: str | None = None
 
+
+# ---------- Helpers ----------
 def ensure_tz_field_id():
+    """Return custom field ID for Time Zone, trying several endpoints; None if not found."""
     if _cache_field_ids.get("tz"):
         return _cache_field_ids["tz"]
-    for url, params in [
-        (f"{GHL_BASE}/custom-fields", {"locationId": LOCATION_ID}),
-        (f"{GHL_BASE}/customFields", {"locationId": LOCATION_ID}),
-        (f"{GHL_BASE}/locations/{LOCATION_ID}/customFields", None),
-    ]:
+
+    candidates = [
+        (f"{GHL_BASE}/custom-fields", {"locationId": LOCATION_ID}),      # kebab
+        (f"{GHL_BASE}/customFields", {"locationId": LOCATION_ID}),       # camel
+        (f"{GHL_BASE}/locations/{LOCATION_ID}/customFields", None),      # scoped
+    ]
+    for url, params in candidates:
         try:
             r = requests.get(url, headers=HEADERS, params=params, timeout=20)
-            if r.status_code == 404: continue
+            if r.status_code == 404:
+                continue
             r.raise_for_status()
-            data = r.json()
-            fields = data.get("customFields") or data.get("fields") or data.get("data") or []
+            j = r.json()
+            fields = j.get("customFields") or j.get("fields") or j.get("data") or []
             for f in fields:
                 label = (f.get("label") or f.get("name") or "").strip()
                 if label.lower() == TZ_FIELD_LABEL.strip().lower():
-                    _cache_field_ids["tz"] = f["id"]; return f["id"]
+                    _cache_field_ids["tz"] = f["id"]
+                    return f["id"]
         except Exception:
-            pass
-    return None
+            continue
+    return None  # fine if missing
 
-def geocode(addr: str):
-    r = requests.get("https://maps.googleapis.com/maps/api/geocode/json",
-                     params={"address": addr, "key": GOOGLE}, timeout=20)
+
+def geocode(full_address: str) -> tuple[float, float]:
+    r = requests.get(
+        "https://maps.googleapis.com/maps/api/geocode/json",
+        params={"address": full_address, "key": GOOGLE},
+        timeout=20,
+    )
     r.raise_for_status()
     j = r.json()
     if not j.get("results"):
-        raise HTTPException(422, "Geocode failed")
+        raise HTTPException(422, f"Geocode failed for: {full_address}")
     loc = j["results"][0]["geometry"]["location"]
     return float(loc["lat"]), float(loc["lng"])
 
-def tz_for(lat: float, lng: float):
-    r = requests.get("https://maps.googleapis.com/maps/api/timezone/json",
-                     params={"location": f"{lat},{lng}", "timestamp": int(time.time()), "key": GOOGLE}, timeout=20)
+
+def tz_for(lat: float, lng: float) -> tuple[str, str | None]:
+    r = requests.get(
+        "https://maps.googleapis.com/maps/api/timezone/json",
+        params={"location": f"{lat},{lng}", "timestamp": int(time.time()), "key": GOOGLE},
+        timeout=20,
+    )
     r.raise_for_status()
     j = r.json()
     if j.get("status") != "OK":
         raise HTTPException(422, f"Timezone lookup failed: {j.get('status')}")
     return j["timeZoneId"], j.get("timeZoneName")
 
-def try_update(url, method, payload):
-    if method == "PUT":
-        r = requests.put(url, json=payload, headers=HEADERS, timeout=20)
-    else:
-        r = requests.patch(url, json=payload, headers=HEADERS, timeout=20)
-    if r.status_code < 300:
-        return True
-    print(f"[TZ-UPDATER][UPDATE-ERR] {method} {url} {r.status_code} {r.text}")
-    return False
 
 def update_ghl(contact_id: str, tz_id: str, tz_name: str | None):
+    """Update the system timeZone and optional custom fields using POST variants."""
     cf_id = ensure_tz_field_id()
+    custom_fields = []
+    if cf_id:
+        custom_fields.append({"id": cf_id, "value": tz_id})
+    if tz_name and TZ_NAME_FIELD_ID:
+        custom_fields.append({"id": TZ_NAME_FIELD_ID, "value": tz_name})
 
-    # Build variants (system field + optional custom fields)
-    base_cf = []
-    if cf_id: base_cf.append({"id": cf_id, "value": tz_id})
-    if tz_name and TZ_NAME_FIELD_ID: base_cf.append({"id": TZ_NAME_FIELD_ID, "value": tz_name})
+    payload = {"id": contact_id, "timeZone": tz_id}
+    if custom_fields:
+        payload["customFields"] = custom_fields
+
+    headers = HEADERS | {"Accept": "application/json"}
 
     variants = [
-        ("PUT",  f"{GHL_BASE}/contacts/",                      {"id": contact_id, "timeZone": tz_id, "customFields": base_cf or None}),
-        ("PUT",  f"{GHL_BASE}/contacts/",                      {"id": contact_id, "timezone": tz_id, "customFields": base_cf or None}),
-        ("PATCH",f"{GHL_BASE}/contacts/{contact_id}",          {"timeZone": tz_id, "customFields": base_cf or None}),
-        ("PATCH",f"{GHL_BASE}/contacts/{contact_id}",          {"timezone": tz_id, "customFields": base_cf or None}),
+        ("POST", f"{GHL_BASE}/contacts",         payload),
+        ("POST", f"{GHL_BASE}/contacts/",        payload),
+        ("POST", f"{GHL_BASE}/contacts/upsert",  payload),
+        ("POST", f"{GHL_BASE}/contacts/upsert/", payload),
     ]
-    # Clean None values
-    variants = [(m,u,{k:v for k,v in p.items() if v is not None}) for (m,u,p) in variants]
 
-    for m,u,p in variants:
-        if try_update(u, m, p): return
-    raise HTTPException(502, "All contact update variants failed")
+    for method, url, body in variants:
+        try:
+            r = requests.post(url, json=body, headers=headers, timeout=20)
+            if r.status_code < 300:
+                print(f"[TZ-UPDATER] Updated via {url}")
+                return
+            print(f"[TZ-UPDATER][UPDATE-ERR] {method} {url} {r.status_code} {r.text}")
+        except Exception as e:
+            print(f"[TZ-UPDATER][UPDATE-ERR] {method} {url} EXC {e}")
 
+    raise HTTPException(502, "All contact POST variants failed")
+
+
+# ---------- Routes ----------
 @app.get("/health")
-def health(): return {"ok": True}
+def health():
+    return {"ok": True}
+
 
 @app.post("/ghl/webhook")
 def ghl_webhook(body: GHLHook, background: BackgroundTasks):
