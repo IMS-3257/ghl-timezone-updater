@@ -1,21 +1,20 @@
-# app.py — Robust GHL Time Zone Updater
-# - Uses env var names: GOOGLE_API_KEY, GHL_API_KEY, GHL_LOCATION_ID
-# - ZIP → city+state → state-only (direct map fallback)
-# - Background processing so GHL webhook returns immediately
-# - Tries POST variants to update the contact; caches custom field lookup
+# app.py — GHL Time Zone Updater with /diag auth check
+# Env vars used: GOOGLE_API_KEY, GHL_API_KEY, GHL_LOCATION_ID
+# ZIP -> city+state -> state-only fallback. Background processing.
+# Contact update via POST variants. /diag tests JWT from the server.
 
 import os, time, requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from pydantic import BaseModel
 
 # ===== Required env =====
-GOOGLE = os.environ["GOOGLE_API_KEY"]           # Google key (Geocoding + Time Zone enabled; billing ON)
-GHL_API_KEY = os.environ["GHL_API_KEY"]         # GHL Location API key (JWT)
-LOCATION_ID = os.environ["GHL_LOCATION_ID"]     # GHL Location ID
+GOOGLE = os.environ["GOOGLE_API_KEY"]
+GHL_API_KEY = os.environ["GHL_API_KEY"]
+LOCATION_ID = os.environ["GHL_LOCATION_ID"]
 
 # ===== Optional env =====
 TZ_FIELD_LABEL = os.getenv("TZ_FIELD_LABEL", "Time Zone")
-TZ_FIELD_ID_ENV = os.getenv("TZ_FIELD_ID")      # optional fixed custom field id
+TZ_FIELD_ID_ENV = os.getenv("TZ_FIELD_ID")
 TZ_NAME_FIELD_ID = os.getenv("TZ_NAME_FIELD_ID")
 
 # ===== GHL API =====
@@ -29,9 +28,8 @@ HEADERS = {
 }
 
 app = FastAPI()
-_cache_field_ids = {"tz": TZ_FIELD_ID_ENV}  # remember found/missing id (None means not found)
+_cache_field_ids = {"tz": TZ_FIELD_ID_ENV}
 
-# ===== US state → primary Olson TZ map (fallback) =====
 STATE_TZ = {
     "AL":"America/Chicago","AK":"America/Anchorage","AZ":"America/Phoenix","AR":"America/Chicago",
     "CA":"America/Los_Angeles","CO":"America/Denver","CT":"America/New_York","DE":"America/New_York",
@@ -48,7 +46,6 @@ STATE_TZ = {
     "WV":"America/New_York","WI":"America/Chicago","WY":"America/Denver",
 }
 
-# ===== Models =====
 class GHLHook(BaseModel):
     contact_id: str | None = None
     id: str | None = None
@@ -59,7 +56,6 @@ class GHLHook(BaseModel):
     zip: str | None = None
     contact: dict | None = None
 
-# ===== Helpers =====
 def get_first(payload: dict, keys: list[str]) -> str | None:
     for k in keys:
         v = payload.get(k)
@@ -72,7 +68,6 @@ def get_first(payload: dict, keys: list[str]) -> str | None:
     return None
 
 def ensure_tz_field_id() -> str | None:
-    # cache hit (including remembered None)
     if "tz" in _cache_field_ids:
         return _cache_field_ids["tz"]
     for url, params in [
@@ -89,14 +84,13 @@ def ensure_tz_field_id() -> str | None:
             for f in fields:
                 label = (f.get("label") or f.get("name") or "").strip()
                 if label.lower() == TZ_FIELD_LABEL.strip().lower():
-                    _cache_field_ids["tz"] = f["id"]
-                    return f["id"]
+                    _cache_field_ids["tz"] = f["id"]; return f["id"]
         except Exception:
             continue
     _cache_field_ids["tz"] = None
     return None
 
-def geocode(address_str: str) -> tuple[float,float] | None:
+def geocode(address_str: str):
     try:
         r = requests.get("https://maps.googleapis.com/maps/api/geocode/json",
                          params={"address": address_str, "key": GOOGLE}, timeout=20)
@@ -108,7 +102,7 @@ def geocode(address_str: str) -> tuple[float,float] | None:
     except Exception:
         return None
 
-def tz_for(lat: float, lng: float) -> tuple[str, str | None] | None:
+def tz_for(lat: float, lng: float):
     try:
         r = requests.get("https://maps.googleapis.com/maps/api/timezone/json",
                          params={"location": f"{lat},{lng}", "timestamp": int(time.time()), "key": GOOGLE},
@@ -132,55 +126,55 @@ def update_contact(contact_id: str, tz_id: str, tz_name: str | None):
         try:
             r = requests.post(url, json=payload, headers=HEADERS, timeout=20)
             if r.status_code < 300:
-                print(f"[TZ-UPDATER] Updated {contact_id} -> {tz_id}")
-                return
+                print(f"[TZ-UPDATER] Updated {contact_id} -> {tz_id}"); return
             print(f"[TZ-UPDATER][UPDATE-ERR] POST {url} {r.status_code} {r.text}")
         except Exception as e:
             print(f"[TZ-UPDATER][UPDATE-ERR] POST {url} EXC {e}")
     raise HTTPException(502, "All contact POST variants failed")
 
-# ===== Routes =====
 @app.get("/health")
 def health(): return {"ok": True}
+
+@app.get("/diag")
+def diag():
+    """Server-side JWT sanity check."""
+    try:
+        r = requests.get(f"{GHL_BASE}/users/me", headers=HEADERS, timeout=15)
+        return {"status": r.status_code, "ok": r.status_code < 300, "body": r.json(), "loc": LOCATION_ID,
+                "token_len": len(GHL_API_KEY)}
+    except Exception as e:
+        return {"status": "error", "error": str(e), "loc": LOCATION_ID, "token_len": len(GHL_API_KEY)}
 
 @app.post("/ghl/webhook")
 async def ghl_webhook(req: Request, background: BackgroundTasks):
     body = await req.json()
     contact_id = get_first(body, ["contact_id","id"])
-    if not contact_id:
-        return {"ok": False, "error": "missing contact_id"}
+    if not contact_id: return {"ok": False, "error": "missing contact_id"}
 
     zip_code = (get_first(body, ["postal_code","zip"]) or "").strip()
     city = (get_first(body, ["city"]) or "").strip()
     state = (get_first(body, ["state"]) or "").strip().upper()
     address = (get_first(body, ["address"]) or "").strip()
 
-    # Build candidate addresses (best → worst)
-    candidates: list[str] = []
+    candidates = []
     if zip_code: candidates.append(f"{zip_code}, USA")
     if city and state: candidates.append(f"{city}, {state}, USA")
     if address and (city or state): candidates.insert(0, f"{address}, {city}, {state}, USA")
+    if state: candidates.append(f"{state}, USA")
 
     def job():
         try:
             tz_id = None; tz_name = None
-
-            # Try geocoding candidates
             for a in candidates:
                 if not a: continue
                 coords = geocode(a)
                 if coords:
                     tz = tz_for(*coords)
                     if tz: tz_id, tz_name = tz; break
-
-            # Fallback: map by state
             if not tz_id and state in STATE_TZ:
-                tz_id = STATE_TZ[state]; tz_name = None
-
+                tz_id = STATE_TZ[state]
             if not tz_id:
-                print(f"[TZ-UPDATER][WARN] No TZ derived. body={body}")
-                return
-
+                print(f"[TZ-UPDATER][WARN] No TZ derived. body={body}"); return
             update_contact(contact_id, tz_id, tz_name)
             print(f"[TZ-UPDATER] contact={contact_id} -> {tz_id} ({tz_name})")
         except Exception as e:
